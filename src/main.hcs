@@ -1,1 +1,571 @@
+// podman-api.hcs – biblioteka do interakcji z Podmanem
+// Użycie: from [podman-api] require [containers_list, container_start, container_stop, images_list, pull_image, run_container]
 
+from [std] require [io, string, math]
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Typy JSON (uproszczone dla odpowiedzi Podmana)
+// ──────────────────────────────────────────────────────────────────────────────
+
+enum JsonType
+    Null
+    Bool
+    Number
+    String
+    Array
+    Object
+end
+
+obj JsonValue
+    type: JsonType
+    bool_val: bool
+    num_val: f64
+    str_val: str
+    array_val: [JsonValue]
+    object_val: [(str, JsonValue)]
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Prosty parser JSON (tylko potrzebne struktury)
+// ──────────────────────────────────────────────────────────────────────────────
+
+obj JsonParser
+    input: str
+    pos: i64
+    len: i64
+end
+
+fn json_peek(p: JsonParser) : i32
+    if p.pos < p.len
+        return p.input.ptr[p.pos] as i32
+    end
+    return 0
+end
+
+fn json_advance(p: JsonParser)
+    if p.pos < p.len
+        p.pos += 1
+    end
+end
+
+fn json_skip_whitespace(p: JsonParser)
+    while p.pos < p.len and (json_peek(p) == 32 or json_peek(p) == 9 or json_peek(p) == 10 or json_peek(p) == 13)
+        json_advance(p)
+    end
+end
+
+fn json_parse_string(p: JsonParser) : Option<str>
+    if json_peek(p) != 34  // '"'
+        return nil
+    end
+    json_advance(p)
+    let start = p.pos
+    while p.pos < p.len and json_peek(p) != 34
+        if json_peek(p) == 92  // '\' escape
+            json_advance(p)
+            if json_peek(p) != 0
+                json_advance(p)
+            end
+        else
+            json_advance(p)
+        end
+    end
+    if json_peek(p) != 34
+        return nil
+    end
+    let result = p.input.ptr[start..p.pos] as str
+    json_advance(p)
+    return result
+end
+
+fn json_parse_number(p: JsonParser) : Option<f64>
+    let start = p.pos
+    let mut has_dot = false
+    while p.pos < p.len and (json_peek(p) >= 48 and json_peek(p) <= 57 or json_peek(p) == 46)
+        if json_peek(p) == 46
+            has_dot = true
+        end
+        json_advance(p)
+    end
+    if start == p.pos
+        return nil
+    end
+    let num_str = p.input.ptr[start..p.pos] as str
+    // konwersja na f64
+    let mut val = 0.0
+    let mut sign = 1.0
+    let mut i = 0
+    let mut dot = false
+    let mut frac = 1.0
+    while i < num_str.len
+        let c = num_str.ptr[i] as i32
+        if c == 45
+            sign = -1.0
+        else if c >= 48 and c <= 57
+            let d = (c - 48) as f64
+            if dot
+                frac /= 10.0
+                val += d * frac
+            else
+                val = val * 10.0 + d
+            end
+        else if c == 46
+            dot = true
+        end
+        i += 1
+    end
+    return sign * val
+end
+
+fn json_parse_bool(p: JsonParser) : Option<bool>
+    if p.pos+3 < p.len and p.input.ptr[p.pos..p.pos+4] as str == "true"
+        p.pos += 4
+        return true
+    end
+    if p.pos+4 < p.len and p.input.ptr[p.pos..p.pos+5] as str == "false"
+        p.pos += 5
+        return false
+    end
+    return nil
+end
+
+fn json_parse_null(p: JsonParser) : bool
+    if p.pos+3 < p.len and p.input.ptr[p.pos..p.pos+4] as str == "null"
+        p.pos += 4
+        return true
+    end
+    return false
+end
+
+fn json_parse_array(p: JsonParser) : Option<[JsonValue]>
+    if json_peek(p) != 91  // '['
+        return nil
+    end
+    json_advance(p)
+    let mut items = [] as [JsonValue]
+    json_skip_whitespace(p)
+    if json_peek(p) == 93  // ']'
+        json_advance(p)
+        return items
+    end
+    loop
+        let val = json_parse_value(p)
+        if val == nil
+            return nil
+        end
+        items.push(val)
+        json_skip_whitespace(p)
+        if json_peek(p) == 44  // ','
+            json_advance(p)
+            json_skip_whitespace(p)
+            continue
+        end
+        break
+    end
+    if json_peek(p) != 93
+        return nil
+    end
+    json_advance(p)
+    return items
+end
+
+fn json_parse_object(p: JsonParser) : Option<[(str, JsonValue)]>
+    if json_peek(p) != 123  // '{'
+        return nil
+    end
+    json_advance(p)
+    let mut fields = [] as [(str, JsonValue)]
+    json_skip_whitespace(p)
+    if json_peek(p) == 125  // '}'
+        json_advance(p)
+        return fields
+    end
+    loop
+        let key = json_parse_string(p)
+        if key == nil
+            return nil
+        end
+        json_skip_whitespace(p)
+        if json_peek(p) != 58  // ':'
+            return nil
+        end
+        json_advance(p)
+        let val = json_parse_value(p)
+        if val == nil
+            return nil
+        end
+        fields.push((key, val))
+        json_skip_whitespace(p)
+        if json_peek(p) == 44  // ','
+            json_advance(p)
+            json_skip_whitespace(p)
+            continue
+        end
+        break
+    end
+    if json_peek(p) != 125
+        return nil
+    end
+    json_advance(p)
+    return fields
+end
+
+fn json_parse_value(p: JsonParser) : Option<JsonValue>
+    json_skip_whitespace(p)
+    let c = json_peek(p)
+    if c == 34  // '"'
+        let s = json_parse_string(p)
+        if s == nil
+            return nil
+        end
+        let val = HCS_ALLOC_ZERO(_scope_arena, JsonValue)
+        val.type = JsonType.String
+        val.str_val = s
+        return val
+    else if c == 91  // '['
+        let arr = json_parse_array(p)
+        if arr == nil
+            return nil
+        end
+        let val = HCS_ALLOC_ZERO(_scope_arena, JsonValue)
+        val.type = JsonType.Array
+        val.array_val = arr
+        return val
+    else if c == 123  // '{'
+        let obj = json_parse_object(p)
+        if obj == nil
+            return nil
+        end
+        let val = HCS_ALLOC_ZERO(_scope_arena, JsonValue)
+        val.type = JsonType.Object
+        val.object_val = obj
+        return val
+    else if c == 116 or c == 102  // true/false
+        let b = json_parse_bool(p)
+        if b == nil
+            return nil
+        end
+        let val = HCS_ALLOC_ZERO(_scope_arena, JsonValue)
+        val.type = JsonType.Bool
+        val.bool_val = b
+        return val
+    else if c == 110  // null
+        if json_parse_null(p)
+            let val = HCS_ALLOC_ZERO(_scope_arena, JsonValue)
+            val.type = JsonType.Null
+            return val
+        end
+    else if c == 45 or (c >= 48 and c <= 57)  // number
+        let n = json_parse_number(p)
+        if n == nil
+            return nil
+        end
+        let val = HCS_ALLOC_ZERO(_scope_arena, JsonValue)
+        val.type = JsonType.Number
+        val.num_val = n
+        return val
+    end
+    return nil
+end
+
+fn json_parse(input: str) : Option<JsonValue>
+    direct
+        let mut p = HCS_ALLOC_ZERO(_scope_arena, JsonParser)
+        p.input = input
+        p.pos = 0
+        p.len = input.len
+        return json_parse_value(p)
+    end
+end
+
+fn json_get_string(obj: JsonValue, key: str) : Option<str>
+    if obj.type != JsonType.Object
+        return nil
+    end
+    for (k, v) in obj.object_val
+        if k == key and v.type == JsonType.String
+            return v.str_val
+        end
+    end
+    return nil
+end
+
+fn json_get_int(obj: JsonValue, key: str) : Option<i64>
+    if obj.type != JsonType.Object
+        return nil
+    end
+    for (k, v) in obj.object_val
+        if k == key and v.type == JsonType.Number
+            return v.num_val as i64
+        end
+    end
+    return nil
+end
+
+fn json_get_bool(obj: JsonValue, key: str) : Option<bool>
+    if obj.type != JsonType.Object
+        return nil
+    end
+    for (k, v) in obj.object_val
+        if k == key and v.type == JsonType.Bool
+            return v.bool_val
+        end
+    end
+    return nil
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Typy dla kontenerów i obrazów
+// ──────────────────────────────────────────────────────────────────────────────
+
+obj Container
+    id: str
+    name: str
+    image: str
+    status: str
+    running: bool
+end
+
+obj Image
+    id: str
+    repository: str
+    tag: str
+    size: i64
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Funkcje pomocnicze do wykonywania poleceń Podmana
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn run_podman(args: [str]) : Option<str>
+    direct
+        // budujemy ciąg poleceń: "podman" + args
+        let mut cmd = "podman" as str
+        for arg in args
+            cmd += " " + arg
+        end
+        let file = popen(cmd.ptr, "r")
+        if file == nil
+            return nil
+        end
+        let mut output = [] as [u8]
+        let mut buf = HCS_ALLOC_N(_scope_arena, u8, 4096)
+        while true
+            let n = fread(buf, 1, 4096, file)
+            if n <= 0
+                break
+            end
+            for i in 0..n
+                output.push(buf[i])
+            end
+        end
+        let status = pclose(file)
+        if status != 0
+            return nil
+        end
+        return output as str
+    end
+end
+
+fn run_podman_json(args: [str]) : Option<JsonValue>
+    let json_args = args
+    json_args.push("--format=json")
+    let out = run_podman(json_args)
+    if out == nil
+        return nil
+    end
+    return json_parse(out)
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// API dla kontenerów
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn containers_list(all: bool) : Option<[Container]>
+    let mut args = ["ps"] as [str]
+    if all
+        args.push("-a")
+    end
+    let json = run_podman_json(args)
+    if json == nil or json.type != JsonType.Array
+        return nil
+    end
+    let mut result = [] as [Container]
+    for item in json.array_val
+        if item.type != JsonType.Object
+            continue
+        end
+        let c = HCS_ALLOC_ZERO(_scope_arena, Container)
+        c.id = json_get_string(item, "Id")
+        c.name = json_get_string(item, "Names")   // może być lista, bierzemy pierwszy
+        c.image = json_get_string(item, "Image")
+        c.status = json_get_string(item, "Status")
+        let running = json_get_bool(item, "Running")
+        c.running = if running != nil { running } else { false }
+        result.push(c)
+    end
+    return result
+end
+
+fn container_inspect(name_or_id: str) : Option<Container>
+    let args = ["inspect", name_or_id]
+    let json = run_podman_json(args)
+    if json == nil or json.type != JsonType.Array or json.array_val.len == 0
+        return nil
+    end
+    let obj = json.array_val[0]
+    if obj.type != JsonType.Object
+        return nil
+    end
+    let c = HCS_ALLOC_ZERO(_scope_arena, Container)
+    c.id = json_get_string(obj, "Id")
+    // name może być w State.Name lub w Name? w zależności od wersji
+    c.name = json_get_string(obj, "Name")
+    c.image = json_get_string(obj, "Image")
+    // status
+    let state = json_get_string(obj, "State")  // może być "running", "exited" itp.
+    if state != nil
+        c.status = state
+        c.running = state == "running"
+    else
+        let running = json_get_bool(obj, "Running")
+        if running != nil
+            c.running = running
+            c.status = if running { "running" } else { "exited" }
+        end
+    end
+    return c
+end
+
+fn container_start(name_or_id: str) : bool
+    let args = ["start", name_or_id]
+    let out = run_podman(args)
+    return out != nil
+end
+
+fn container_stop(name_or_id: str) : bool
+    let args = ["stop", name_or_id]
+    let out = run_podman(args)
+    return out != nil
+end
+
+fn container_restart(name_or_id: str) : bool
+    let args = ["restart", name_or_id]
+    let out = run_podman(args)
+    return out != nil
+end
+
+fn container_rm(name_or_id: str, force: bool) : bool
+    let mut args = ["rm"] as [str]
+    if force
+        args.push("-f")
+    end
+    args.push(name_or_id)
+    let out = run_podman(args)
+    return out != nil
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// API dla obrazów
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn images_list() : Option<[Image]>
+    let args = ["images"]
+    let json = run_podman_json(args)
+    if json == nil or json.type != JsonType.Array
+        return nil
+    end
+    let mut result = [] as [Image]
+    for item in json.array_val
+        if item.type != JsonType.Object
+            continue
+        end
+        let img = HCS_ALLOC_ZERO(_scope_arena, Image)
+        img.id = json_get_string(item, "Id")
+        img.repository = json_get_string(item, "Repository")
+        img.tag = json_get_string(item, "Tag")
+        let size = json_get_int(item, "Size")
+        img.size = if size != nil { size } else { 0 }
+        result.push(img)
+    end
+    return result
+end
+
+fn pull_image(image_name: str) : bool
+    let args = ["pull", image_name]
+    let out = run_podman(args)
+    return out != nil
+end
+
+fn image_rm(image_id: str, force: bool) : bool
+    let mut args = ["rmi"] as [str]
+    if force
+        args.push("-f")
+    end
+    args.push(image_id)
+    let out = run_podman(args)
+    return out != nil
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Uruchamianie kontenera
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn run_container(image: str, cmd: [str], detach: bool, rm: bool, name: str) : Option<str>
+    let mut args = ["run"] as [str]
+    if detach
+        args.push("-d")
+    end
+    if rm
+        args.push("--rm")
+    end
+    if name != ""
+        args.push("--name")
+        args.push(name)
+    end
+    args.push(image)
+    for c in cmd
+        args.push(c)
+    end
+    let out = run_podman(args)
+    if out == nil
+        return nil
+    end
+    // jeśli detach, out to ID kontenera (z nową linią)
+    if detach
+        let id = out.trim()
+        return id
+    end
+    return ""
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Przykład użycia (komentarz)
+// ──────────────────────────────────────────────────────────────────────────────
+/*
+from [podman-api] require [containers_list, pull_image, run_container, container_stop]
+
+fn main() : i32
+    // lista kontenerów
+    let containers = containers_list(true)
+    if containers != nil
+        for c in containers
+            write [Container: {c.name} ({c.id}) - {c.status}]
+        end
+    end
+
+    // pobranie obrazu
+    if not pull_image("alpine:latest")
+        write [Failed to pull alpine]
+        return 1
+    end
+
+    // uruchomienie kontenera
+    let id = run_container("alpine:latest", ["sh", "-c", "echo hello"], true, true, "test")
+    if id != nil
+        write [Container started: {id}]
+    end
+
+    return 0
+end
+*/
